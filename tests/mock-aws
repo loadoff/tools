@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Minimal aws mock for ecs-exec tests. Controlled via MOCK_AWS_* env vars.
+set -euo pipefail
+
+args=("$@")
+
+# strip global flags we might see
+profile=""
+region=""
+filtered=()
+i=0
+while (( i < ${#args[@]} )); do
+  case "${args[$i]}" in
+    --profile)
+      profile="${args[$((i + 1))]}"
+      i=$((i + 2))
+      ;;
+    --region)
+      region="${args[$((i + 1))]}"
+      i=$((i + 2))
+      ;;
+    *)
+      filtered+=("${args[$i]}")
+      i=$((i + 1))
+      ;;
+  esac
+done
+
+cmd="${filtered[0]:-}"
+sub="${filtered[1]:-}"
+
+if [[ "$cmd" == "ecs" && "$sub" == "list-clusters" ]]; then
+  echo "${MOCK_AWS_CLUSTERS:-arn:aws:ecs:ap-northeast-1:123:cluster/demo}"
+  exit 0
+fi
+
+if [[ "$cmd" == "ecs" && "$sub" == "list-services" ]]; then
+  echo "${MOCK_AWS_SERVICES:-arn:aws:ecs:ap-northeast-1:123:service/demo/web}"
+  exit 0
+fi
+
+if [[ "$cmd" == "ecs" && "$sub" == "list-tasks" ]]; then
+  if [[ "${MOCK_AWS_TASKS:-}" == "EMPTY" ]]; then
+    echo ""
+    exit 0
+  fi
+  echo "${MOCK_AWS_TASKS:-arn:aws:ecs:ap-northeast-1:123:task/demo/task-1}"
+  exit 0
+fi
+
+if [[ "$cmd" == "ecs" && "$sub" == "describe-tasks" ]]; then
+  if [[ "${MOCK_AWS_CONTAINERS:-}" == "MULTI" ]]; then
+    echo -e "app\nsidecar"
+    exit 0
+  fi
+  echo "${MOCK_AWS_CONTAINERS:-app}"
+  exit 0
+fi
+
+if [[ "$cmd" == "ecs" && "$sub" == "execute-command" ]]; then
+  # echo the effective invocation for assertions
+  printf 'MOCK_EXECUTE'
+  for a in "${filtered[@]}"; do
+    printf ' %s' "$a"
+  done
+  printf '\n'
+  exit 0
+fi
+
+echo "mock-aws: unhandled: ${filtered[*]}" >&2
+exit 99
