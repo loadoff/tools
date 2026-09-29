@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# ecs-exec: aws ecs execute-command を引数または対話で簡単に起動する
+# Compatible with bash 3.2+ (macOS /bin/bash).
+set -euo pipefail
+
+AWS_CLI="${AWS_CLI:-aws}"
+COMMAND="/bin/sh"
+CLUSTER=""
+SERVICE=""
+TASK=""
+CONTAINER=""
+PROFILE=""
+REGION=""
+DRY_RUN=0
+LIST_ONLY=0
+
+usage() {
+  cat <<'EOF'
+Usage: ecs-exec [options]
+
+Easy wrapper around `aws ecs execute-command`.
+
+Options:
+  --cluster NAME       ECS cluster name or ARN
+  --service NAME       Service name (picks a running task)
+  --task ID            Task ID or ARN (overrides --service)
+  --container NAME     Container name (required if task has multiple)
+  --command CMD        Remote command (default: /bin/sh)
+  --profile NAME       AWS profile
+  --region REGION      AWS region
+  --list               List clusters / services / tasks and exit
+  --dry-run            Print the execute-command invocation and exit
+  -h, --help           Show this help
+
+If cluster / service|task / container are omitted, values are chosen
+interactively from `aws ecs` listings (non-interactive shells error).
+
+Environment:
+  AWS_CLI              Override aws binary (default: aws). Used by tests.
+EOF
+}
+
+die() {
+  echo "ecs-exec: $*" >&2
+  exit 1
+}
+
+need_aws() {
+  if ! command -v "$AWS_CLI" >/dev/null 2>&1; then
+    die "AWS CLI not found (looked for '$AWS_CLI'). Install awscli v2 and retry."
+  fi
+}
+
+aws_base() {
+  AWS_GLOBAL_ARGS=()
+  if [[ -n "$PROFILE" ]]; then
+    AWS_GLOBAL_ARGS+=(--profile "$PROFILE")
+  fi
+  if [[ -n "$REGION" ]]; then
+    AWS_GLOBAL_ARGS+=(--region "$REGION")
+  fi
+}
+
+run_aws() {
+  aws_base
+  if [[ ${#AWS_GLOBAL_ARGS[@]} -gt 0 ]]; then
+    "$AWS_CLI" "${AWS_GLOBAL_ARGS[@]}" "$@"
+  else
+    "$AWS_CLI" "$@"
+  fi
+}
+
+is_tty() {
+  [[ -t 0 && -t 1 ]]
+}
+
+# read_lines VARNAME — fill global array named VARNAME from stdin
+read_lines() {
+  local __varname="$1"
+  local __line
+  eval "$__varname=()"
+  while IFS= read -r __line || [[ -n "$__line" ]]; do
+    [[ -z "$__line" ]] && continue
+    eval "$__varname+=(\"\$__line\")"
+  done
+}
+
+pick_one() {
+  # pick_one <prompt> <line1> <line2> ...
+  local prompt="$1"
+  shift
+  local count=$#
+
+  if [[ "$count" -eq 0 ]]; then
+    die "no candidates for: $prompt"
+  fi
+  if [[ "$count" -eq 1 ]]; then
+    printf '%s\n' "$1"
+    return 0
+  fi
+  if ! is_tty; then
+    die "multiple candidates for '$prompt' but stdin is not a TTY; pass an explicit flag"
+  fi
+
+  echo "$prompt" >&2
+  local i=1
+  local item
+  for item in "$@"; do
+    printf '  [%d] %s\n' "$i" "$item" >&2
+    i=$((i + 1))
+  done
+  local choice
+  while true; do
+    printf 'Select [1-%d]: ' "$count" >&2
+    read -r choice || die "selection cancelled"
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$count" ]]; then
+      eval "printf '%s\\n' \"\$$((choice))\""
+      return 0
+    fi
+    echo "Invalid selection." >&2
+  done
+}
+
+list_clusters() {
+  run_aws ecs list-clusters --query 'clusterArns[]' --output text 2>/dev/null \
+    | tr '\t' '\n' | sed '/^$/d' | while IFS= read -r arn; do
+        basename "$arn"
+      done
+}
+
+list_services() {
+  local cluster="$1"
+  run_aws ecs list-services --cluster "$cluster" --query 'serviceArns[]' --output text 2>/dev/null \
+    | tr '\t' '\n' | sed '/^$/d' | while IFS= read -r arn; do
+        basename "$arn"
+      done
+}
+
+list_running_tasks() {
+  local cluster="$1"
+  local service="${2:-}"
+  if [[ -n "$service" ]]; then
+    run_aws ecs list-tasks --cluster "$cluster" --service-name "$service" \
+      --desired-status RUNNING --query 'taskArns[]' --output text 2>/dev/null
+  else
+    run_aws ecs list-tasks --cluster "$cluster" \
+      --desired-status RUNNING --query 'taskArns[]' --output text 2>/dev/null
+  fi | tr '\t' '\n' | sed '/^$/d'
+}
+
+task_short_id() {
+  basename "$1"
+}
+
+list_containers() {
+  local cluster="$1"
+  local task="$2"
+  run_aws ecs describe-tasks --cluster "$cluster" --tasks "$task" \
+    --query 'tasks[0].containers[].name' --output text 2>/dev/null \
+    | tr '\t' '\n' | sed '/^$/d'
+}
+
+do_list() {
+  need_aws
+  echo "== Clusters =="
+  local clusters=()
+  read_lines clusters < <(list_clusters)
+  if [[ ${#clusters[@]} -eq 0 ]]; then
+    echo "(none)"
+    return 0
+  fi
+  local c s t
+  local services=()
+  local tasks=()
+  for c in "${clusters[@]}"; do
+    echo "- $c"
+    services=()
+    read_lines services < <(list_services "$c")
+    for s in "${services[@]}"; do
+      echo "  - service: $s"
+      tasks=()
+      read_lines tasks < <(list_running_tasks "$c" "$s")
+      for t in "${tasks[@]}"; do
+        echo "    - task: $(task_short_id "$t")"
+      done
+    done
+  done
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cluster)
+      [[ $# -ge 2 ]] || die "--cluster requires a value"
+      CLUSTER="$2"
+      shift 2
+      ;;
+    --service)
+      [[ $# -ge 2 ]] || die "--service requires a value"
+      SERVICE="$2"
+      shift 2
+      ;;
+    --task)
+      [[ $# -ge 2 ]] || die "--task requires a value"
+      TASK="$2"
+      shift 2
+      ;;
+    --container)
+      [[ $# -ge 2 ]] || die "--container requires a value"
+      CONTAINER="$2"
+      shift 2
+      ;;
+    --command)
+      [[ $# -ge 2 ]] || die "--command requires a value"
+      COMMAND="$2"
+      shift 2
+      ;;
+    --profile)
+      [[ $# -ge 2 ]] || die "--profile requires a value"
+      PROFILE="$2"
+      shift 2
+      ;;
+    --region)
+      [[ $# -ge 2 ]] || die "--region requires a value"
+      REGION="$2"
+      shift 2
+      ;;
+    --list)
+      LIST_ONLY=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1 (try --help)"
+      ;;
+  esac
+done
+
+if [[ "$LIST_ONLY" -eq 1 ]]; then
+  do_list
+  exit 0
+fi
+
+need_aws
+
+if [[ -z "$CLUSTER" ]]; then
+  _clusters=()
+  read_lines _clusters < <(list_clusters)
+  CLUSTER="$(pick_one "Select cluster:" "${_clusters[@]}")"
+fi
+
+if [[ -z "$TASK" ]]; then
+  if [[ -z "$SERVICE" ]]; then
+    _services=()
+    read_lines _services < <(list_services "$CLUSTER")
+    if [[ ${#_services[@]} -gt 0 ]]; then
+      SERVICE="$(pick_one "Select service:" "${_services[@]}")"
+    fi
+  fi
+  _tasks=()
+  read_lines _tasks < <(list_running_tasks "$CLUSTER" "${SERVICE:-}")
+  if [[ ${#_tasks[@]} -eq 0 ]]; then
+    if [[ -n "${SERVICE:-}" ]]; then
+      die "no RUNNING tasks in cluster='$CLUSTER' service='$SERVICE'"
+    fi
+    die "no RUNNING tasks in cluster='$CLUSTER'"
+  fi
+  _short=()
+  for t in "${_tasks[@]}"; do
+    _short+=("$(task_short_id "$t")")
+  done
+  if [[ ${#_tasks[@]} -eq 1 ]]; then
+    TASK="${_tasks[0]}"
+  else
+    local_pick="$(pick_one "Select task:" "${_short[@]}")"
+    TASK=""
+    i=0
+    for s in "${_short[@]}"; do
+      if [[ "$s" == "$local_pick" ]]; then
+        TASK="${_tasks[$i]}"
+        break
+      fi
+      i=$((i + 1))
+    done
+    [[ -n "$TASK" ]] || die "failed to resolve task for selection '$local_pick'"
+  fi
+fi
+
+_containers=()
+read_lines _containers < <(list_containers "$CLUSTER" "$TASK")
+if [[ ${#_containers[@]} -eq 0 ]]; then
+  die "no containers found for task='$TASK' in cluster='$CLUSTER'"
+fi
+if [[ -z "$CONTAINER" ]]; then
+  if [[ ${#_containers[@]} -eq 1 ]]; then
+    CONTAINER="${_containers[0]}"
+  else
+    CONTAINER="$(pick_one "Select container:" "${_containers[@]}")"
+  fi
+else
+  found=0
+  for c in "${_containers[@]}"; do
+    if [[ "$c" == "$CONTAINER" ]]; then
+      found=1
+      break
+    fi
+  done
+  if [[ "$found" -eq 0 ]]; then
+    die "container '$CONTAINER' not in task (have: ${_containers[*]})"
+  fi
+fi
+
+exec_args=(ecs execute-command
+  --cluster "$CLUSTER"
+  --task "$TASK"
+  --container "$CONTAINER"
+  --interactive
+  --command "$COMMAND"
+)
+if [[ -n "$PROFILE" ]]; then
+  exec_args=(--profile "$PROFILE" "${exec_args[@]}")
+fi
+if [[ -n "$REGION" ]]; then
+  exec_args=(--region "$REGION" "${exec_args[@]}")
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  # bash 3.2 has no %q; print with simple quoting
+  printf '%s' "$AWS_CLI"
+  for a in "${exec_args[@]}"; do
+    case "$a" in
+      *[!A-Za-z0-9_./:@+=,-]* | "")
+        printf " '%s'" "${a//'/\'\'}"
+        ;;
+      *)
+        printf ' %s' "$a"
+        ;;
+    esac
+  done
+  printf '\n'
+  exit 0
+fi
+
+exec "$AWS_CLI" "${exec_args[@]}"
